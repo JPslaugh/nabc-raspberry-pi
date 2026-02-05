@@ -16,6 +16,9 @@
 #include <map>
 #include <chrono>
 #include <thread>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
 
 class TM_ControlSystem {
 private:
@@ -25,11 +28,12 @@ private:
     std::vector<std::shared_ptr<ICommunicationInterface>> commInterfaces_;
     
     std::unique_ptr<SafetyMonitor> safetyMonitor_;
-    std::unique_ptr<DataLogger> logger_;
+    std::shared_ptr<DataLogger> logger_;
     std::unique_ptr<ECUManager> ecuManager_;
     
     bool systemRunning_;
     std::chrono::milliseconds loopPeriod_;
+    std::string telemetryFilePath_;
 
     // Control state
     struct ControlState {
@@ -42,15 +46,17 @@ private:
 public:
     TM_ControlSystem() 
         : systemRunning_(false), 
-          loopPeriod_(100) { // 10 Hz default
+                    loopPeriod_(100),
+                    telemetryFilePath_("./telemetry.json") { // 10 Hz default
         controlState_ = {0.0, 0.0, false, false};
+                safetyMonitor_ = std::make_unique<SafetyMonitor>();
     }
 
     bool initialize() {
         std::cout << "Initializing ROV Control System...\n";
 
         // Create logger first
-        logger_ = std::make_unique<DataLogger>("rov_log.txt");
+        logger_ = std::make_shared<DataLogger>("rov_log.txt");
         logger_->initialize();
         logger_->log("System initialization started");
 
@@ -73,8 +79,10 @@ public:
         // Print ECU table to console
         ecuManager_->printSystemStatus();
 
-        // Create safety monitor
-        safetyMonitor_ = std::make_unique<SafetyMonitor>();
+        // Initialize safety monitor
+        if (!safetyMonitor_) {
+            safetyMonitor_ = std::make_unique<SafetyMonitor>();
+        }
         safetyMonitor_->initialize();
 
         // Initialize all sensors
@@ -383,6 +391,9 @@ public:
                 
                 // 6. Update communication timestamps for ECUs
                 updateECUCommunicationStatus();
+
+                // 7. Publish telemetry snapshot to local JSON file
+                writeTelemetrySnapshot();
             }
 
             // Sleep briefly to avoid busy-waiting
@@ -447,6 +458,105 @@ public:
         // Format: [Header][Sensor1][Sensor2]...[Actuator1]...[Checksum]
         
         return packet;
+    }
+
+    std::string getIsoTimestamp() const {
+        auto now = std::chrono::system_clock::now();
+        auto time = std::chrono::system_clock::to_time_t(now);
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()) % 1000;
+
+        std::stringstream ss;
+        ss << std::put_time(std::gmtime(&time), "%Y-%m-%dT%H:%M:%S");
+        ss << '.' << std::setfill('0') << std::setw(3) << ms.count() << "Z";
+        return ss.str();
+    }
+
+    std::string jsonEscape(const std::string& input) const {
+        std::string output;
+        output.reserve(input.size());
+        for (char c : input) {
+            switch (c) {
+                case '\\': output += "\\\\"; break;
+                case '"': output += "\\\""; break;
+                case '\n': output += "\\n"; break;
+                case '\r': output += "\\r"; break;
+                case '\t': output += "\\t"; break;
+                default: output += c; break;
+            }
+        }
+        return output;
+    }
+
+    void writeTelemetrySnapshot() {
+        std::ofstream file(telemetryFilePath_, std::ios::trunc);
+        if (!file.is_open()) {
+            return;
+        }
+
+        std::stringstream ss;
+        ss << "{";
+        ss << "\"timestamp\":\"" << getIsoTimestamp() << "\",";
+
+        ss << "\"system\":{";
+        ss << "\"safe\":" << (safetyMonitor_ && safetyMonitor_->isSystemSafe() ? "true" : "false") << ",";
+        ss << "\"violation\":\"" << jsonEscape(safetyMonitor_ ? safetyMonitor_->getLastViolation() : "") << "\"";
+        ss << "},";
+
+        ss << "\"control\":{";
+        ss << "\"depthSetpoint\":" << controlState_.depthSetpoint << ",";
+        ss << "\"headingSetpoint\":" << controlState_.headingSetpoint << ",";
+        ss << "\"autoDepth\":" << (controlState_.autoDepthControl ? "true" : "false") << ",";
+        ss << "\"autoHeading\":" << (controlState_.autoHeadingControl ? "true" : "false");
+        ss << "},";
+
+        ss << "\"sensors\":[";
+        for (size_t i = 0; i < sensors_.size(); ++i) {
+            const auto& sensor = sensors_[i];
+            double value = sensor->readValue();
+            ss << "{";
+            ss << "\"name\":\"" << jsonEscape(sensor->getComponentName()) << "\",";
+            ss << "\"value\":" << value << ",";
+            ss << "\"units\":\"" << jsonEscape(sensor->getUnits()) << "\",";
+            ss << "\"healthy\":" << (sensor->isHealthy() ? "true" : "false");
+
+            if (auto imu = dynamic_cast<IMUSensor*>(sensor.get())) {
+                auto data = imu->getData();
+                ss << ",\"imu\":{";
+                ss << "\"roll\":" << data.roll << ",";
+                ss << "\"pitch\":" << data.pitch << ",";
+                ss << "\"yaw\":" << data.yaw << ",";
+                ss << "\"accelX\":" << data.accelX << ",";
+                ss << "\"accelY\":" << data.accelY << ",";
+                ss << "\"accelZ\":" << data.accelZ;
+                ss << "}";
+            }
+
+            ss << "}";
+            if (i + 1 < sensors_.size()) {
+                ss << ",";
+            }
+        }
+        ss << "],";
+
+        ss << "\"actuators\":[";
+        for (size_t i = 0; i < actuators_.size(); ++i) {
+            const auto& actuator = actuators_[i];
+            ss << "{";
+            ss << "\"name\":\"" << jsonEscape(actuator->getComponentName()) << "\",";
+            ss << "\"command\":" << actuator->getCommand() << ",";
+            ss << "\"feedback\":" << actuator->getFeedback() << ",";
+            ss << "\"interlock\":" << (actuator->hasInterlock() ? "true" : "false");
+            ss << "}";
+            if (i + 1 < actuators_.size()) {
+                ss << ",";
+            }
+        }
+        ss << "]";
+
+        ss << "}";
+        file << ss.str();
+        file.close();
     }
 
     void start() {
@@ -526,5 +636,7 @@ public:
         return ecuManager_.get();
     }
 };
+
+using ROVControlSystem = TM_ControlSystem;
 
 #endif
